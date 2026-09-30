@@ -1,484 +1,708 @@
-name: Hermes + 9Router (guided setup and run)
+name: Hermes + 9Router
 
 on:
   workflow_dispatch:
-    inputs:
-      mode:
-        description: "initial-setup: configure both dashboards; run: restore and start"
-        required: true
-        type: choice
-        options:
-          - initial-setup
-          - run
-        default: initial-setup
-      total_minutes:
-        description: "Total job lifetime (30-345 minutes)"
-        required: true
-        type: string
-        default: "345"
 
 permissions:
   contents: read
 
 concurrency:
-  group: hermes-9router
+  group: hermes-9router-${{ github.repository }}
   cancel-in-progress: false
 
-env:
-  ROOT_DIR: ${{ github.workspace }}/.runtime
-  WORK_DIR: ${{ github.workspace }}/.runtime/work
-  HERMES_IMAGE: nousresearch/hermes-agent:latest
-  ROUTER_IMAGE: decolua/9router:latest
-
 jobs:
-  guided-agent:
+  run:
     runs-on: ubuntu-latest
     timeout-minutes: 360
+
+    env:
+      STATE_PASSWORD: ${{ secrets.STATE_PASSWORD }}
+      RUNTIME_ROOT: ${{ github.workspace }}/.runtime
+      LIVE_ROOT: ${{ github.workspace }}/.runtime/live
+      WORKSPACE_ROOT: ${{ github.workspace }}/.runtime/live/hermes/workspace
+      CACHE_ROOT: ${{ github.workspace }}/.runtime/cache
+      CONTROL_PORT: "18080"
+      NINEROUTER_PORT: "20128"
+      HERMES_DASHBOARD_PORT: "9119"
+      TOTAL_MINUTES: "330"
+      SETUP_TIMEOUT_SECONDS: "450"
+      NINEROUTER_IMAGE: "ghcr.io/decolua/9router:0.5.81"
+      HERMES_IMAGE: "nousresearch/hermes-agent:v2026.9.24"
+      CLOUDFLARED_VERSION: "2026.9.3"
+      CLOUDFLARED_SHA256: "77e26d8d900e0b8469f416239d14b5f296525fdf79fee6f511ef55609e3fbac2"
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Restore encrypted state
+      - name: Restore latest encrypted state cache
         uses: actions/cache/restore@v4
         with:
-          path: .runtime/state.enc
-          key: hermes-9router-encrypted-${{ github.run_id }}
+          path: .runtime/cache
+          key: hermes-9router-state-${{ github.repository_id }}-${{ github.run_id }}
           restore-keys: |
-            hermes-9router-encrypted-
+            hermes-9router-state-${{ github.repository_id }}-
 
-      - name: Validate and decrypt state
+      - name: Prepare runtime and restore encrypted state
         shell: bash
-        env:
-          STATE_PASSWORD: ${{ secrets.STATE_PASSWORD }}
-          MODE: ${{ inputs.mode }}
-          TOTAL_MINUTES: ${{ inputs.total_minutes }}
         run: |
-          set -euo pipefail
-          [[ -n "$STATE_PASSWORD" ]] || {
-            echo "Missing Actions secret: STATE_PASSWORD"
-            exit 1
-          }
-          (( ${#STATE_PASSWORD} >= 20 )) || {
-            echo "STATE_PASSWORD must contain at least 20 characters"
-            exit 1
-          }
-          [[ "$STATE_PASSWORD" != *$'\n'* && "$STATE_PASSWORD" != *$'\r'* ]] || {
-            echo "STATE_PASSWORD must be a single-line value"
-            exit 1
-          }
-          [[ "$TOTAL_MINUTES" =~ ^[0-9]+$ ]] || {
-            echo "total_minutes must be an integer"
-            exit 1
-          }
-          (( TOTAL_MINUTES >= 30 && TOTAL_MINUTES <= 345 )) || {
-            echo "total_minutes must be between 30 and 345"
+          set -Eeuo pipefail
+
+          test -n "${STATE_PASSWORD:-}" || {
+            echo 'ERROR: GitHub Secret STATE_PASSWORD is missing.' >&2
             exit 1
           }
 
-          mkdir -p "$WORK_DIR/hermes" "$WORK_DIR/9router"
-          chmod 700 "$ROOT_DIR" "$WORK_DIR" "$WORK_DIR/hermes" "$WORK_DIR/9router"
-
-          if [[ -s "$ROOT_DIR/state.enc" ]]; then
-            openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 \
-              -pass env:STATE_PASSWORD \
-              -in "$ROOT_DIR/state.enc" |
-              tar -xz -C "$WORK_DIR"
-            echo "Encrypted state restored."
-          elif [[ "$MODE" == run ]]; then
-            echo "No saved state exists. Run initial-setup first."
+          case "$STATE_PASSWORD" in
+            *$'\n'*|*$'\r'*)
+              echo 'ERROR: STATE_PASSWORD must be a single-line secret.' >&2
+              exit 1
+              ;;
+          esac
+          [ "${#STATE_PASSWORD}" -ge 20 ] || {
+            echo 'ERROR: STATE_PASSWORD must be at least 20 characters.' >&2
             exit 1
+          }
+
+          rm -rf "$LIVE_ROOT" "$RUNTIME_ROOT/bin" "$RUNTIME_ROOT/control" "$RUNTIME_ROOT/logs"
+          mkdir -p "$LIVE_ROOT/9router" "$LIVE_ROOT/hermes/workspace" "$CACHE_ROOT"
+
+          if [ -f "$CACHE_ROOT/state.enc" ]; then
+            echo 'Encrypted state found; decrypting...'
+            tmp_tar="$RUNTIME_ROOT/state.tar"
+            if ! openssl enc -d -aes-256-cbc -pbkdf2 \
+                -in "$CACHE_ROOT/state.enc" \
+                -out "$tmp_tar" \
+                -pass env:STATE_PASSWORD; then
+              echo 'ERROR: STATE_PASSWORD does not match the saved state.' >&2
+              rm -f "$tmp_tar"
+              exit 1
+            fi
+            tar -xpf "$tmp_tar" -C "$LIVE_ROOT" --no-same-owner --no-overwrite-dir
+            rm -f "$tmp_tar"
           else
-            echo "Starting with a new state."
+            echo 'No previous state found; entering guided first setup.'
           fi
 
-          touch "$ROOT_DIR/can-save"
-          deadline=$(( $(date +%s) + TOTAL_MINUTES * 60 ))
-          echo "$deadline" > "$ROOT_DIR/deadline"
+          chmod 700 "$LIVE_ROOT" "$LIVE_ROOT/9router" "$LIVE_ROOT/hermes"
+          chmod 700 "$LIVE_ROOT/hermes/workspace"
 
-      - name: Create guided setup controller
+      - name: Main runtime
         shell: bash
         run: |
-          set -euo pipefail
-          mkdir -p "$ROOT_DIR/controller" "$ROOT_DIR/signals"
-          cat > "$ROOT_DIR/controller/control.py" <<'PY'
-          import html
+          set -Eeuo pipefail
+
+          : "${STATE_PASSWORD:?STATE_PASSWORD is required}"
+
+          mkdir -p "$RUNTIME_ROOT/bin" "$RUNTIME_ROOT/control" "$RUNTIME_ROOT/logs"
+          CONTROL_DIR="$RUNTIME_ROOT/control"
+          CONTROL_SCRIPT="$RUNTIME_ROOT/bin/control_server.py"
+          CONTROL_STAGE="$CONTROL_DIR/stage"
+          CONTROL_CONTINUE="$CONTROL_DIR/continue-9router"
+          CONTROL_START="$CONTROL_DIR/start-hermes"
+          CONTROL_KEY="$CONTROL_DIR/ninerouter-api-key"
+          CONTROL_KEY_VALID="$CONTROL_DIR/ninerouter-api-key.valid"
+          CONTROL_KEY_ERROR="$CONTROL_DIR/ninerouter-api-key.error"
+
+          cat > "$CONTROL_SCRIPT" <<'PY'
+          import base64
+          import hmac
           import os
-          import threading
+          import pathlib
           import time
+          import urllib.error
+          import urllib.request
+          from http import HTTPStatus
           from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+          from urllib.parse import parse_qs
 
-          phase = os.environ.get("SETUP_PHASE", "setup")
-          title = os.environ.get("SETUP_TITLE", "Setup")
-          button = os.environ.get("SETUP_BUTTON", "Continue")
-          signal = f"/signals/{phase}.done"
+          ROOT = pathlib.Path(os.environ["CONTROL_DIR"])
+          STAGE_FILE = ROOT / "stage"
+          CONTINUE_FILE = ROOT / "continue-9router"
+          START_FILE = ROOT / "start-hermes"
+          KEY_FILE = ROOT / "ninerouter-api-key"
+          KEY_VALID_FILE = ROOT / "ninerouter-api-key.valid"
+          KEY_ERROR_FILE = ROOT / "ninerouter-api-key.error"
+          PASSWORD = os.environ["CONTROL_PASSWORD"]
+          USERNAME = "admin"
+          NINEROUTER_PORT = int(os.environ.get("NINEROUTER_PORT", "20128"))
 
-          def page(message=""):
-              return f"""<!doctype html><html><head><meta charset='utf-8'>
-          <meta name='viewport' content='width=device-width,initial-scale=1'>
-          <title>{html.escape(title)}</title><style>
-          body{{font-family:system-ui;background:#0b1020;color:#eef2ff;display:grid;
-          place-items:center;min-height:100vh;margin:0}}main{{max-width:620px;padding:32px;
-          background:#151c32;border:1px solid #33416b;border-radius:18px}}
-          a,button{{font:inherit;background:#6d5dfc;color:white;border:0;border-radius:10px;
-          padding:14px 20px;cursor:pointer;text-decoration:none}}p{{line-height:1.8}}
-          </style></head><body><main><h1>{html.escape(title)}</h1>
-          <p>ابتدا تنظیمات را در داشبورد کامل کنید. سپس به این صفحه برگردید و دکمه زیر را بزنید.</p>
-          <p><a href='/'>بازگشت به داشبورد</a></p><form method='post'>
-          <button type='submit'>{html.escape(button)}</button></form><p>{html.escape(message)}</p>
-          </main></body></html>""".encode()
+          def stage():
+              try:
+                  return STAGE_FILE.read_text(encoding="utf-8").strip()
+              except FileNotFoundError:
+                  return "starting"
+
+          def read_text(path: pathlib.Path, default=""):
+              try:
+                  return path.read_text(encoding="utf-8")
+              except FileNotFoundError:
+                  return default
+
+          def authorized(header: str | None) -> bool:
+              if not header or not header.startswith("Basic "):
+                  return False
+              try:
+                  raw = base64.b64decode(header[6:], validate=True).decode("utf-8")
+                  user, password = raw.split(":", 1)
+              except Exception:
+                  return False
+              return hmac.compare_digest(user, USERNAME) and hmac.compare_digest(password, PASSWORD)
+
+          def atomically_write(path: pathlib.Path, value: str):
+              tmp = path.with_suffix(path.suffix + ".tmp")
+              fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+              try:
+                  with os.fdopen(fd, "w", encoding="utf-8") as f:
+                      f.write(value)
+                      f.flush()
+                      os.fsync(f.fileno())
+                  os.replace(tmp, path)
+                  dir_fd = os.open(str(path.parent), os.O_RDONLY)
+                  try:
+                      os.fsync(dir_fd)
+                  finally:
+                      os.close(dir_fd)
+              finally:
+                  try:
+                      tmp.unlink()
+                  except FileNotFoundError:
+                      pass
+
+          def validate_api_key(api_key: str) -> tuple[bool, str]:
+              req = urllib.request.Request(
+                  f"http://127.0.0.1:{NINEROUTER_PORT}/v1/models",
+                  headers={"Authorization": f"Bearer {api_key}", "Accept": "application/json"},
+                  method="GET",
+              )
+              try:
+                  with urllib.request.urlopen(req, timeout=12) as response:
+                      if response.status != 200:
+                          return False, f"9Router returned HTTP {response.status}."
+                      body = response.read(1024 * 1024)
+                      if b'"data"' not in body:
+                          return False, "9Router returned an unexpected /v1/models response."
+                      return True, "API key accepted."
+              except urllib.error.HTTPError as exc:
+                  if exc.code == 401:
+                      return False, "API key rejected by 9Router (401 Unauthorized)."
+                  return False, f"9Router returned HTTP {exc.code}."
+              except Exception as exc:
+                  return False, f"Could not validate the API key: {exc.__class__.__name__}."
+
+          def html(title: str, body: str) -> bytes:
+              return f"""<!doctype html>
+          <html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>
+          <title>{title}</title>
+          <style>body{{font-family:system-ui,sans-serif;max-width:760px;margin:40px auto;padding:0 18px;line-height:1.5}}button{{font-size:18px;padding:12px 18px;border:0;border-radius:10px;cursor:pointer}}input{{width:100%;box-sizing:border-box;font:16px monospace;padding:12px;border:1px solid #ccc;border-radius:10px;margin:10px 0 16px}}.box{{padding:20px;border:1px solid #ddd;border-radius:14px}}.ok{{color:#087f23}}.err{{color:#b00020}}</style></head>
+          <body><div class='box'>{body}</div></body></html>""".encode("utf-8")
 
           class Handler(BaseHTTPRequestHandler):
-              def do_GET(self):
-                  body = page()
-                  self.send_response(200); self.send_header("Content-Type", "text/html; charset=utf-8")
-                  self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
-              def do_POST(self):
-                  os.makedirs("/signals", exist_ok=True)
-                  tmp = signal + ".tmp"
-                  with open(tmp, "w", encoding="utf-8") as handle:
-                      handle.write("done\n")
-                      handle.flush()
-                      os.fsync(handle.fileno())
-                  os.replace(tmp, signal)
-                  body = page("ثبت شد؛ Workflow در حال رفتن به مرحله بعد است. صفحه Actions را Refresh کنید.")
-                  self.send_response(200); self.send_header("Content-Type", "text/html; charset=utf-8")
-                  self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
-                  self.wfile.flush()
-                  # A second independent signal: a clean controller exit.
-                  # This avoids a stalled setup if a bind-mounted signal file
-                  # is not observed promptly by the hosted runner.
-                  def stop_server():
-                      time.sleep(0.5)
-                      self.server.shutdown()
-                  threading.Thread(target=stop_server, daemon=True).start()
-              def log_message(self, fmt, *args):
-                  print(fmt % args, flush=True)
+              server_version = "Hermes9RouterControl/3.0"
 
-          ThreadingHTTPServer(("0.0.0.0", 8090), Handler).serve_forever()
+              def log_message(self, fmt, *args):
+                  return
+
+              def send(self, status: int, content: bytes, content_type="text/html; charset=utf-8"):
+                  self.send_response(status)
+                  self.send_header("Content-Type", content_type)
+                  self.send_header("Cache-Control", "no-store")
+                  self.send_header("Content-Length", str(len(content)))
+                  self.end_headers()
+                  self.wfile.write(content)
+
+              def require_auth(self) -> bool:
+                  if authorized(self.headers.get("Authorization")):
+                      return True
+                  self.send_response(HTTPStatus.UNAUTHORIZED)
+                  self.send_header("WWW-Authenticate", 'Basic realm="Hermes + 9Router"')
+                  self.send_header("Content-Length", "0")
+                  self.end_headers()
+                  return False
+
+              def do_GET(self):
+                  if self.path == "/health":
+                      self.send(HTTPStatus.OK, b'{"ok":true}', "application/json")
+                      return
+                  if not self.require_auth():
+                      return
+
+                  current = stage()
+                  key_valid = KEY_VALID_FILE.exists()
+                  key_error = read_text(KEY_ERROR_FILE).strip()
+
+                  if current == "9router":
+                      if key_valid:
+                          body = """
+                          <h1>9Router setup completed?</h1>
+                          <p class='ok'>9Router API key validated successfully.</p>
+                          <p>حالا تنظیمات Provider و Modelها را در 9Router کامل کنید.</p>
+                          <form method='POST' action='/continue-9router'><button>Continue to Hermes setup</button></form>
+                          """
+                      else:
+                          error_html = f"<p class='err'><b>{key_error}</b></p>" if key_error else ""
+                          body = f"""
+                          <h1>9Router setup</h1>
+                          <p>در Dashboard 9Router از مسیر <b>Settings → API Keys</b> یک API Key بسازید، سپس همین‌جا وارد کنید.</p>
+                          {error_html}
+                          <form method='POST' action='/save-9router-key'>
+                            <label for='api_key'>9Router API Key</label>
+                            <input id='api_key' name='api_key' type='password' autocomplete='off' required>
+                            <button>Validate API Key</button>
+                          </form>
+                          """
+                  elif current == "hermes":
+                      body = """
+                      <h1>Hermes setup completed?</h1>
+                      <p>در Dashboard هرمس مدل 9Router، Telegram و هر credential/tool موردنیاز را تنظیم کنید.</p>
+                      <form method='POST' action='/start-hermes'><button>Start Hermes Agent</button></form>
+                      """
+                  elif current == "running":
+                      body = "<h1>Both services are running</h1><p>Hermes و 9Router فعال هستند.</p>"
+                  else:
+                      body = "<h1>Starting...</h1><p>چند لحظه بعد صفحه را Refresh کنید.</p>"
+                  self.send(HTTPStatus.OK, html("Hermes + 9Router", body))
+
+              def do_POST(self):
+                  if not self.require_auth():
+                      return
+                  length = int(self.headers.get("Content-Length", "0"))
+                  if length > 16384:
+                      self.send(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, html("Too large", "<h1>Request too large</h1>"))
+                      return
+                  raw = self.rfile.read(length) if length else b""
+
+                  if self.path == "/save-9router-key" and stage() == "9router":
+                      try:
+                          form = parse_qs(raw.decode("utf-8"), keep_blank_values=True)
+                      except Exception:
+                          self.send(HTTPStatus.BAD_REQUEST, html("Invalid request", "<h1>Invalid form data</h1>"))
+                          return
+                      api_key = (form.get("api_key") or [""])[0].strip()
+                      if not api_key or "\n" in api_key or "\r" in api_key or any(ch.isspace() for ch in api_key):
+                          atomically_write(KEY_ERROR_FILE, "API key is empty or contains whitespace/newlines.")
+                          KEY_VALID_FILE.unlink(missing_ok=True)
+                          self.send(HTTPStatus.BAD_REQUEST, html("Invalid API key", "<h1>Invalid API key</h1><p>کلید نباید خالی باشد یا whitespace/newline داشته باشد.</p>"))
+                          return
+
+                      atomically_write(KEY_FILE, api_key)
+                      KEY_ERROR_FILE.unlink(missing_ok=True)
+                      ok, message = validate_api_key(api_key)
+                      if ok:
+                          atomically_write(KEY_VALID_FILE, "valid")
+                          self.send(HTTPStatus.OK, html("Validated", "<h1 class='ok'>API Key validated</h1><p>کلید 9Router معتبر است. حالا تنظیمات Provider/Model را کامل کنید و Continue را بزنید.</p><p><a href='/'>Back</a></p>"))
+                      else:
+                          KEY_VALID_FILE.unlink(missing_ok=True)
+                          KEY_FILE.unlink(missing_ok=True)
+                          atomically_write(KEY_ERROR_FILE, message)
+                          self.send(HTTPStatus.UNAUTHORIZED, html("Rejected", f"<h1 class='err'>API Key rejected</h1><p>{message}</p><p><a href='/'>Try again</a></p>"))
+                      return
+
+                  if self.path == "/continue-9router" and stage() == "9router" and KEY_VALID_FILE.exists():
+                      atomically_write(CONTINUE_FILE, str(int(time.time())))
+                      self.send(HTTPStatus.OK, html("Registered", "<h1>ثبت شد</h1><p>Workflow وارد مرحله Hermes می‌شود.</p>"))
+                      return
+
+                  if self.path == "/start-hermes" and stage() == "hermes":
+                      atomically_write(START_FILE, str(int(time.time())))
+                      self.send(HTTPStatus.OK, html("Registered", "<h1>ثبت شد</h1><p>Hermes Agent شروع می‌شود.</p>"))
+                      return
+
+                  self.send(HTTPStatus.CONFLICT, html("Invalid state", "<h1>مرحله نامعتبر</h1>"))
+
+          server = ThreadingHTTPServer(("127.0.0.1", int(os.environ.get("CONTROL_PORT", "18080"))), Handler)
+          server.daemon_threads = True
+          print(f"control-server listening on 127.0.0.1:{server.server_address[1]}", flush=True)
+          server.serve_forever()
           PY
 
-      - name: Pull images and create network
-        shell: bash
-        run: |
-          set -euo pipefail
-          docker network create agent-net >/dev/null 2>&1 || true
-          docker pull "$ROUTER_IMAGE"
-          docker pull "$HERMES_IMAGE"
-          docker pull nginx:alpine
-          docker pull python:3.13-alpine
-          docker pull cloudflare/cloudflared:latest
+          export CONTROL_DIR CONTROL_PASSWORD="$STATE_PASSWORD" CONTROL_PORT NINEROUTER_PORT
+          nohup python3 "$CONTROL_SCRIPT" > "$RUNTIME_ROOT/logs/control.log" 2>&1 &
+          echo $! > "$RUNTIME_ROOT/control.pid"
 
-      - name: Start 9Router
-        shell: bash
-        env:
-          STATE_PASSWORD: ${{ secrets.STATE_PASSWORD }}
-        run: |
-          set -euo pipefail
+          cleanup() {
+            set +e
+            if [ -f "$RUNTIME_ROOT/cloudflared-9router.pid" ]; then kill "$(cat "$RUNTIME_ROOT/cloudflared-9router.pid")" 2>/dev/null || true; fi
+            if [ -f "$RUNTIME_ROOT/cloudflared-hermes.pid" ]; then kill "$(cat "$RUNTIME_ROOT/cloudflared-hermes.pid")" 2>/dev/null || true; fi
+            if [ -f "$RUNTIME_ROOT/cloudflared-control.pid" ]; then kill "$(cat "$RUNTIME_ROOT/cloudflared-control.pid")" 2>/dev/null || true; fi
+            docker rm -f hermes-dashboard 2>/dev/null || true
+            docker rm -f hermes-gateway 2>/dev/null || true
+            docker rm -f hermes 2>/dev/null || true
+            docker rm -f 9router 2>/dev/null || true
+            if [ -f "$RUNTIME_ROOT/control.pid" ]; then kill "$(cat "$RUNTIME_ROOT/control.pid")" 2>/dev/null || true; fi
+          }
+          trap cleanup EXIT
+
+          # Stable technical secrets derived from the single user-managed secret.
+          JWT_SECRET="$(printf '9router-jwt:%s' "$STATE_PASSWORD" | sha256sum | awk '{print $1}')"
+          API_KEY_SECRET="$(printf '9router-api:%s' "$STATE_PASSWORD" | sha256sum | awk '{print $1}')"
+          MACHINE_ID_SALT="$(printf '9router-machine:%s' "$STATE_PASSWORD" | sha256sum | awk '{print $1}')"
+          HERMES_AUTH_SECRET="$(printf 'hermes-dashboard:%s' "$STATE_PASSWORD" | sha256sum | awk '{print $1}')"
+
           docker rm -f 9router >/dev/null 2>&1 || true
           docker run -d \
             --name 9router \
-            --restart unless-stopped \
-            --network agent-net \
-            -v "$WORK_DIR/9router:/app/data" \
+            -p 127.0.0.1:${NINEROUTER_PORT}:20128 \
+            -v "$LIVE_ROOT/9router:/app/data" \
             -e DATA_DIR=/app/data \
             -e PORT=20128 \
-            -e HOSTNAME=0.0.0.0 \
             -e NODE_ENV=production \
-            -e BASE_URL=http://localhost:20128 \
-            -e NEXT_PUBLIC_BASE_URL=http://localhost:20128 \
+            -e JWT_SECRET="$JWT_SECRET" \
             -e INITIAL_PASSWORD="$STATE_PASSWORD" \
-            -e JWT_SECRET="$STATE_PASSWORD-jwt" \
-            -e API_KEY_SECRET="$STATE_PASSWORD-api" \
-            -e MACHINE_ID_SALT="$STATE_PASSWORD-machine" \
-            -e REQUIRE_API_KEY=false \
-            "$ROUTER_IMAGE"
+            -e API_KEY_SECRET="$API_KEY_SECRET" \
+            -e MACHINE_ID_SALT="$MACHINE_ID_SALT" \
+            -e REQUIRE_API_KEY=true \
+            -e ENABLE_REQUEST_LOGS=false \
+            -e OBSERVABILITY_ENABLED=false \
+            -e AUTH_COOKIE_SECURE=true \
+            -e BASE_URL="http://127.0.0.1:20128" \
+            "$NINEROUTER_IMAGE" >/dev/null
 
-          for i in {1..60}; do
-            if docker exec 9router wget -qO- http://127.0.0.1:20128/ >/dev/null 2>&1; then
-              echo "9Router is ready."
-              exit 0
-            fi
-            sleep 2
-          done
-          docker logs --tail 300 9router
-          exit 1
-
-      - name: Guided 9Router setup
-        if: inputs.mode == 'initial-setup'
-        shell: bash
-        env:
-          STATE_PASSWORD: ${{ secrets.STATE_PASSWORD }}
-        run: |
-          set -euo pipefail
-          rm -f "$ROOT_DIR/signals/router.done"
-          proxy="$RUNNER_TEMP/router-proxy"
-          mkdir -p "$proxy"
-          printf 'admin:%s\n' "$(openssl passwd -apr1 "$STATE_PASSWORD")" > "$proxy/htpasswd"
-          cat > "$proxy/default.conf" <<'NGINX'
-          server {
-            listen 8080;
-            client_max_body_size 30m;
-            auth_basic "Private setup";
-            auth_basic_user_file /etc/nginx/htpasswd;
-            location /__control/ { proxy_pass http://127.0.0.1:8090/; }
-            location / {
-              proxy_pass http://127.0.0.1:20128;
-              proxy_http_version 1.1;
-              proxy_set_header Host $host;
-              proxy_set_header X-Forwarded-Proto https;
-              proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-              proxy_set_header Upgrade $http_upgrade;
-              proxy_set_header Connection "upgrade";
-            }
+          wait_http() {
+            local url="$1"; local seconds="${2:-90}"; local i
+            for ((i=1; i<=seconds; i++)); do
+              if curl -fsS --max-time 3 "$url" >/dev/null 2>&1; then return 0; fi
+              sleep 1
+            done
+            echo "ERROR: service did not become ready: $url" >&2
+            return 1
           }
-          NGINX
-          chmod 644 "$proxy/default.conf" "$proxy/htpasswd"
 
-          docker run -d --name router-control --network container:9router \
-            -v "$ROOT_DIR/controller/control.py:/app/control.py:ro" \
-            -v "$ROOT_DIR/signals:/signals" \
-            -e SETUP_PHASE=router -e SETUP_TITLE='9Router setup completed?' \
-            -e SETUP_BUTTON='Continue to Hermes setup' \
-            python:3.13-alpine python /app/control.py
-          docker run -d --name router-proxy --restart unless-stopped --network container:9router \
-            -v "$proxy/default.conf:/etc/nginx/conf.d/default.conf:ro" \
-            -v "$proxy/htpasswd:/etc/nginx/htpasswd:ro" nginx:alpine
-          docker run -d --name router-tunnel --restart unless-stopped --network container:9router \
-            cloudflare/cloudflared:latest tunnel --no-autoupdate --url http://127.0.0.1:8080
+          wait_http "http://127.0.0.1:${NINEROUTER_PORT}/api/health" 120
+          curl -fsS --max-time 5 "http://127.0.0.1:${NINEROUTER_PORT}/dashboard" >/dev/null
 
-          url=""
-          for i in {1..40}; do
-            url="$(docker logs router-tunnel 2>&1 | grep -Eo 'https://[-a-z0-9]+\.trycloudflare\.com' | tail -1 || true)"
-            [[ -n "$url" ]] && break
-            sleep 2
-          done
-          [[ -n "$url" ]] || { docker logs router-tunnel; exit 1; }
-          {
-            echo "## Step 1 — Configure 9Router"
-            echo ""
-            echo "Dashboard: $url/dashboard"
-            echo ""
-            echo "After configuration: $url/__control/"
-            echo ""
-            echo "Basic Auth username: \`admin\`"
-            echo ""
-            echo "Basic Auth password and initial 9Router password: your \`STATE_PASSWORD\`"
-          } >> "$GITHUB_STEP_SUMMARY"
-          echo "9Router dashboard: $url/dashboard"
-          echo "Continue button: $url/__control/"
+          install_cloudflared() {
+            local tmp="$RUNTIME_ROOT/bin/cloudflared.tmp"
+            local url="https://github.com/cloudflare/cloudflared/releases/download/${CLOUDFLARED_VERSION}/cloudflared-linux-amd64"
+            # Always materialize the exact pinned binary at the path used below.
+            # This avoids the preinstalled-PATH vs RUNTIME_ROOT mismatch.
+            curl -fsSL "$url" -o "$tmp"
+            printf '%s  %s\n' "$CLOUDFLARED_SHA256" "$tmp" | sha256sum -c -
+            mv -f "$tmp" "$RUNTIME_ROOT/bin/cloudflared"
+            chmod 0755 "$RUNTIME_ROOT/bin/cloudflared"
+          }
+          install_cloudflared
+          CF="$RUNTIME_ROOT/bin/cloudflared"
 
-          deadline="$(cat "$ROOT_DIR/deadline")"
-          until [[ -f "$ROOT_DIR/signals/router.done" ]]; do
-            (( $(date +%s) < deadline - 600 )) || {
-              echo "Not enough job time remains for Hermes setup."
-              exit 1
-            }
-            [[ "$(docker inspect -f '{{.State.Running}}' 9router)" == true ]] || exit 1
-
-            # The controller exits cleanly after a successful button click.
-            # Accept that as an independent fallback to the bind-mounted file.
-            if [[ "$(docker inspect -f '{{.State.Running}}' router-control 2>/dev/null || echo false)" != true ]]; then
-              code="$(docker inspect -f '{{.State.ExitCode}}' router-control 2>/dev/null || echo 1)"
-              if [[ "$code" == 0 ]]; then
-                echo "9Router continuation confirmed by controller exit."
-                break
+          start_tunnel() {
+            local name="$1"; local target="$2"; local check_path="$3"; local use_auth="${4:-false}"
+            local log="$RUNTIME_ROOT/logs/${name}.log"; local pid_file="$RUNTIME_ROOT/cloudflared-${name}.pid"
+            : > "$log"
+            nohup "$CF" tunnel --no-autoupdate --protocol http2 --url "$target" > "$log" 2>&1 &
+            echo $! > "$pid_file"
+            local i url
+            for ((i=1; i<=120; i++)); do
+              if ! kill -0 "$(cat "$pid_file")" 2>/dev/null; then
+                echo "ERROR: Cloudflare tunnel process exited for $name" >&2
+                tail -n 80 "$log" >&2 || true
+                return 1
               fi
-              docker logs router-control 2>&1 || true
-              echo "9Router setup controller stopped unexpectedly."
-              exit 1
-            fi
-            sleep 2
-          done
-          # Keep the authenticated 9Router dashboard tunnel alive while the
-          # agent runs. Only the one-time continuation controller is removed.
-          docker rm -f router-control >/dev/null 2>&1 || true
-
-      - name: Preconfigure Hermes local 9Router endpoint
-        if: inputs.mode == 'initial-setup'
-        shell: bash
-        run: |
-          set -euo pipefail
-          uid="$(id -u)"; gid="$(id -g)"
-          set_config() {
-            docker run --rm --network agent-net \
-              -v "$WORK_DIR/hermes:/opt/data" \
-              -e HERMES_UID="$uid" -e HERMES_GID="$gid" \
-              "$HERMES_IMAGE" config set "$1" "$2"
-          }
-          set_config model.provider custom
-          set_config model.base_url http://9router:20128/v1
-          set_config model.api_key unused-local-key
-          set_config platforms.telegram.extra.drop_pending_on_cold_boot false
-
-      - name: Guided Hermes dashboard setup
-        if: inputs.mode == 'initial-setup'
-        shell: bash
-        env:
-          STATE_PASSWORD: ${{ secrets.STATE_PASSWORD }}
-        run: |
-          set -euo pipefail
-          rm -f "$ROOT_DIR/signals/hermes.done"
-          docker rm -f hermes-dashboard >/dev/null 2>&1 || true
-          docker run -d --name hermes-dashboard --restart unless-stopped --network agent-net \
-            -v "$WORK_DIR/hermes:/opt/data" \
-            -e HERMES_UID="$(id -u)" -e HERMES_GID="$(id -g)" \
-            "$HERMES_IMAGE" dashboard --host 127.0.0.1 --no-open
-
-          for i in {1..60}; do
-            if docker exec hermes-dashboard python -c \
-              'import urllib.request; urllib.request.urlopen("http://127.0.0.1:9119/", timeout=2)' \
-              >/dev/null 2>&1; then break; fi
-            [[ "$i" != 60 ]] || { docker logs hermes-dashboard; exit 1; }
-            sleep 2
-          done
-
-          proxy="$RUNNER_TEMP/hermes-proxy"
-          mkdir -p "$proxy"
-          printf 'admin:%s\n' "$(openssl passwd -apr1 "$STATE_PASSWORD")" > "$proxy/htpasswd"
-          cat > "$proxy/default.conf" <<'NGINX'
-          server {
-            listen 8080;
-            client_max_body_size 30m;
-            auth_basic "Private setup";
-            auth_basic_user_file /etc/nginx/htpasswd;
-            location /__control/ { proxy_pass http://127.0.0.1:8090/; }
-            location / {
-              proxy_pass http://127.0.0.1:9119;
-              proxy_http_version 1.1;
-              # Hermes is deliberately bound to loopback. Rewrite Host/Origin
-              # to that loopback endpoint so its DNS-rebinding guard accepts
-              # requests arriving through this authenticated temporary tunnel.
-              proxy_set_header Host 127.0.0.1:9119;
-              proxy_set_header Origin http://127.0.0.1:9119;
-              proxy_set_header X-Forwarded-Proto https;
-              proxy_set_header Upgrade $http_upgrade;
-              proxy_set_header Connection "upgrade";
-            }
-          }
-          NGINX
-          chmod 644 "$proxy/default.conf" "$proxy/htpasswd"
-
-          docker run -d --name hermes-control --network container:hermes-dashboard \
-            -v "$ROOT_DIR/controller/control.py:/app/control.py:ro" \
-            -v "$ROOT_DIR/signals:/signals" \
-            -e SETUP_PHASE=hermes -e SETUP_TITLE='Hermes setup completed?' \
-            -e SETUP_BUTTON='Start Hermes Agent' \
-            python:3.13-alpine python /app/control.py
-          docker run -d --name hermes-proxy --restart unless-stopped --network container:hermes-dashboard \
-            -v "$proxy/default.conf:/etc/nginx/conf.d/default.conf:ro" \
-            -v "$proxy/htpasswd:/etc/nginx/htpasswd:ro" nginx:alpine
-          docker run -d --name hermes-tunnel --restart unless-stopped --network container:hermes-dashboard \
-            cloudflare/cloudflared:latest tunnel --no-autoupdate --url http://127.0.0.1:8080
-
-          url=""
-          for i in {1..40}; do
-            url="$(docker logs hermes-tunnel 2>&1 | grep -Eo 'https://[-a-z0-9]+\.trycloudflare\.com' | tail -1 || true)"
-            [[ -n "$url" ]] && break
-            sleep 2
-          done
-          [[ -n "$url" ]] || { docker logs hermes-tunnel; exit 1; }
-          {
-            echo "## Step 2 — Configure Hermes"
-            echo ""
-            echo "Dashboard: $url/"
-            echo ""
-            echo "After configuring the model and Telegram: $url/__control/"
-            echo ""
-            echo "Basic Auth username: \`admin\`"
-            echo ""
-            echo "Basic Auth password: your \`STATE_PASSWORD\`"
-          } >> "$GITHUB_STEP_SUMMARY"
-          echo "Hermes dashboard: $url/"
-          echo "Start button: $url/__control/"
-
-          deadline="$(cat "$ROOT_DIR/deadline")"
-          until [[ -f "$ROOT_DIR/signals/hermes.done" ]]; do
-            (( $(date +%s) < deadline - 180 )) || {
-              echo "Not enough job time remains to start the agent."
-              exit 1
-            }
-            [[ "$(docker inspect -f '{{.State.Running}}' hermes-dashboard)" == true ]] || exit 1
-
-            if [[ "$(docker inspect -f '{{.State.Running}}' hermes-control 2>/dev/null || echo false)" != true ]]; then
-              code="$(docker inspect -f '{{.State.ExitCode}}' hermes-control 2>/dev/null || echo 1)"
-              if [[ "$code" == 0 ]]; then
-                echo "Hermes start confirmed by controller exit."
-                break
+              url="$(grep -oE 'https://[-a-z0-9]+\.trycloudflare\.com' "$log" | tail -n1 || true)"
+              if [ -n "$url" ]; then
+                if [ "$use_auth" = true ]; then
+                  if curl -fsS --max-time 8 --user "admin:${STATE_PASSWORD}" "$url$check_path" >/dev/null 2>&1; then
+                    echo "$url"
+                    return 0
+                  fi
+                elif curl -fsS --max-time 8 "$url$check_path" >/dev/null 2>&1; then
+                  echo "$url"
+                  return 0
+                fi
               fi
-              docker logs hermes-control 2>&1 || true
-              echo "Hermes setup controller stopped unexpectedly."
-              exit 1
-            fi
-            sleep 2
-          done
-          # Keep the authenticated Hermes dashboard and its tunnel available
-          # during the running phase. Remove only the one-time start button.
-          docker rm -f hermes-control >/dev/null 2>&1 || true
+              sleep 1
+            done
+            echo "ERROR: Cloudflare Quick Tunnel did not become reachable for $name" >&2
+            tail -n 100 "$log" >&2 || true
+            return 1
+          }
 
-      - name: Start Hermes gateway
-        shell: bash
-        run: |
-          set -euo pipefail
-          docker rm -f hermes >/dev/null 2>&1 || true
-          docker run -d --name hermes --restart unless-stopped --network agent-net \
-            -v "$WORK_DIR/hermes:/opt/data" \
-            -e HERMES_UID="$(id -u)" -e HERMES_GID="$(id -g)" \
-            "$HERMES_IMAGE" gateway run
-          sleep 12
-          if [[ "$(docker inspect -f '{{.State.Running}}' hermes)" != true ]]; then
-            docker logs --tail 300 hermes
-            exit 1
+          CONTROL_URL="$(start_tunnel control "http://127.0.0.1:${CONTROL_PORT}" "/health")"
+          NINEROUTER_URL="$(start_tunnel 9router "http://127.0.0.1:${NINEROUTER_PORT}" "/api/health")"
+
+          setup_complete=false
+          runtime_end_at=0
+          if [ -f "$LIVE_ROOT/SETUP_COMPLETE" ]; then
+            persisted_key="$(sed -n 's/^NINEROUTER_API_KEY=//p' "$LIVE_ROOT/hermes/.env" 2>/dev/null | tail -n1 || true)"
+            if [ -n "$persisted_key" ]; then
+              case "$persisted_key" in *$'\n'*|*$'\r'*|*[[:space:]]*) persisted_key="";; esac
+            fi
+            if [ -n "$persisted_key" ]; then
+              setup_complete=true
+            else
+              echo 'Saved SETUP_COMPLETE exists but NINEROUTER_API_KEY is missing/invalid; re-enter the key.'
+            fi
           fi
-          docker logs --tail 100 hermes
-          echo "## Hermes Agent is running" >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Keep both services running
-        shell: bash
-        run: |
-          set -euo pipefail
-          deadline="$(cat "$ROOT_DIR/deadline")"
-          while (( $(date +%s) < deadline - 90 )); do
-            for container in 9router hermes; do
-              if [[ "$(docker inspect -f '{{.State.Running}}' "$container" 2>/dev/null || true)" != true ]]; then
-                echo "$container stopped unexpectedly"
-                docker logs --tail 300 "$container" || true
+          if [ "$setup_complete" != true ]; then
+            printf '%s\n' '9router' > "$CONTROL_STAGE"
+            {
+              echo '## 9Router setup'
+              echo
+              echo "- 9Router: $NINEROUTER_URL"
+              echo "- Control: $CONTROL_URL"
+              echo '- 9Router dashboard password: same value as the GitHub Secret `STATE_PASSWORD`'
+              echo '- API Key: create it manually in 9Router Dashboard → Settings → API Keys, then paste it into the protected Control page.'
+              echo
+              echo 'After configuring 9Router, open the Control URL and press **Continue to Hermes setup**.'
+            } >> "$GITHUB_STEP_SUMMARY"
+
+            SETUP_END_AT="$(( $(date +%s) + SETUP_TIMEOUT_SECONDS ))"
+            while [ ! -f "$CONTROL_KEY_VALID" ]; do
+              [ "$(date +%s)" -lt "$SETUP_END_AT" ] || { echo 'ERROR: 9Router API key setup timeout reached.' >&2; exit 1; }
+              if ! docker inspect -f '{{.State.Running}}' 9router 2>/dev/null | grep -qx true; then
+                echo 'ERROR: 9Router container stopped during setup.' >&2
+                docker logs --tail 120 9router >&2 || true
                 exit 1
               fi
+              sleep 2
             done
-            sleep 20
-          done
 
-      - name: Stop and encrypt persistent state
-        if: always() && !cancelled()
-        shell: bash
-        env:
-          STATE_PASSWORD: ${{ secrets.STATE_PASSWORD }}
-        run: |
-          set +e
-          echo '===== Hermes logs ====='
-          docker logs --tail 200 hermes 2>&1 || true
-          echo '===== 9Router logs ====='
-          docker logs --tail 100 9router 2>&1 || true
-          docker rm -f \
-            router-tunnel router-proxy router-control \
-            hermes-tunnel hermes-proxy hermes-control \
-            hermes-dashboard hermes 9router >/dev/null 2>&1 || true
-
-          if [[ -f "$ROOT_DIR/can-save" && -n "$STATE_PASSWORD" ]]; then
-            sudo chown -R "$(id -u):$(id -g)" "$WORK_DIR" || true
-            tmp="$ROOT_DIR/state.enc.tmp"
-            tar -cz -C "$WORK_DIR" hermes 9router |
-              openssl enc -aes-256-cbc -salt -pbkdf2 -iter 200000 \
-                -pass env:STATE_PASSWORD -out "$tmp"
-            chmod 600 "$tmp"
-            mv "$tmp" "$ROOT_DIR/state.enc"
-            echo "State encrypted successfully."
+            SETUP_END_AT="$(( $(date +%s) + SETUP_TIMEOUT_SECONDS ))"
+            while [ ! -f "$CONTROL_CONTINUE" ]; do
+              [ "$(date +%s)" -lt "$SETUP_END_AT" ] || { echo 'ERROR: 9Router setup continuation timeout reached.' >&2; exit 1; }
+              if ! docker inspect -f '{{.State.Running}}' 9router 2>/dev/null | grep -qx true; then
+                echo 'ERROR: 9Router container stopped during setup.' >&2
+                docker logs --tail 120 9router >&2 || true
+                exit 1
+              fi
+              sleep 2
+            done
           fi
 
-      - name: Save encrypted state
-        if: always() && !cancelled()
+          # Hermes capability configuration: use the official full Telegram/CLI presets.
+          # These presets cover the complete supported tool registry for each platform.
+          hermes_config_set() {
+            local key="$1"
+            local value="$2"
+            docker run --rm \
+              -v "$LIVE_ROOT/hermes:/opt/data" \
+              -e HERMES_HOME=/opt/data \
+              -e HOME=/opt/data \
+              "$HERMES_IMAGE" config set "$key" "$value" >/dev/null
+          }
+
+          hermes_config_set 'terminal.backend' 'local'
+          hermes_config_set 'terminal.cwd' '/opt/data/workspace'
+          hermes_config_set 'terminal.timeout' '180'
+          hermes_config_set 'terminal.persistent_shell' 'true'
+          hermes_config_set 'platform_toolsets.telegram' '["hermes-telegram"]'
+          hermes_config_set 'platform_toolsets.cli' '["hermes-cli"]'
+
+          # Preflight the pinned Hermes image and verify the official Telegram tool preset is available.
+          docker run --rm -v "$LIVE_ROOT/hermes:/opt/data" -e HERMES_HOME=/opt/data -e HOME=/opt/data "$HERMES_IMAGE" --version
+          TOOL_OUTPUT="$(docker run --rm -v "$LIVE_ROOT/hermes:/opt/data" -e HERMES_HOME=/opt/data -e HOME=/opt/data "$HERMES_IMAGE" chat --list-tools 2>&1)" || {
+            printf '%s\n' "$TOOL_OUTPUT" >&2
+            exit 1
+          }
+          for required_tool in terminal read_file write_file patch search_files; do
+            printf '%s\n' "$TOOL_OUTPUT" | grep -Eq "(^|[^[:alnum:]_])${required_tool}([^[:alnum:]_]|$)" || {
+              echo "ERROR: Hermes tool '$required_tool' is not available in the pinned image." >&2
+              exit 1
+            }
+          done
+
+          # The 9Router API key is entered manually in the protected control page on first setup.
+          # On later runs it is restored from the encrypted Hermes .env state.
+          if [ -s "$CONTROL_KEY_VALID" ] && [ -s "$CONTROL_KEY" ]; then
+            NINEROUTER_API_KEY="$(cat "$CONTROL_KEY")"
+          else
+            NINEROUTER_API_KEY="$(sed -n 's/^NINEROUTER_API_KEY=//p' "$LIVE_ROOT/hermes/.env" 2>/dev/null | tail -n1 || true)"
+          fi
+          test -n "$NINEROUTER_API_KEY" || { echo 'ERROR: 9Router API key is missing. Run the guided setup and enter it manually.' >&2; exit 1; }
+          case "$NINEROUTER_API_KEY" in *$'\n'*|*$'\r'*|*[[:space:]]*) echo 'ERROR: 9Router API key contains whitespace/newlines.' >&2; exit 1;; esac
+
+          # Verify that the manually supplied/persisted key still authenticates against this 9Router instance.
+          curl -fsS --max-time 15 \
+            -H "Authorization: Bearer $NINEROUTER_API_KEY" \
+            -H 'Accept: application/json' \
+            "http://127.0.0.1:${NINEROUTER_PORT}/v1/models" >/dev/null || {
+              echo 'ERROR: saved 9Router API key is no longer accepted by 9Router.' >&2
+              echo 'Re-run guided setup and generate/enter a valid key from 9Router Dashboard → Settings → API Keys.' >&2
+              exit 1
+            }
+
+          HERMES_ENV_FILE="$LIVE_ROOT/hermes/.env"
+          export NINEROUTER_API_KEY HERMES_ENV_FILE
+          python3 - <<'PY'
+          import os, pathlib, tempfile
+          path = pathlib.Path(os.environ['HERMES_ENV_FILE'])
+          secret = os.environ['NINEROUTER_API_KEY']
+          existing = path.read_text(encoding='utf-8') if path.exists() else ''
+          out=[]
+          replaced=False
+          for line in existing.splitlines():
+              if line.startswith('NINEROUTER_API_KEY='):
+                  if not replaced:
+                      out.append('NINEROUTER_API_KEY=' + secret)
+                      replaced=True
+                  continue
+              out.append(line)
+          if not replaced:
+              out.append('NINEROUTER_API_KEY=' + secret)
+          data='\n'.join(out).rstrip('\n')+'\n'
+          path.parent.mkdir(parents=True, exist_ok=True)
+          with tempfile.NamedTemporaryFile('w', encoding='utf-8', dir=path.parent, delete=False) as f:
+              f.write(data); f.flush(); os.fsync(f.fileno()); tmp=f.name
+          os.chmod(tmp, 0o600)
+          os.replace(tmp, path)
+          PY
+          chmod 600 "$HERMES_ENV_FILE"
+          unset NINEROUTER_API_KEY
+
+          # Configure the named custom provider without putting the secret into config.yaml.
+          hermes_config_set 'providers.9router.name' '9Router'
+          hermes_config_set 'providers.9router.api' "http://127.0.0.1:${NINEROUTER_PORT}/v1"
+          hermes_config_set 'providers.9router.key_env' 'NINEROUTER_API_KEY'
+          hermes_config_set 'providers.9router.transport' 'chat_completions'
+          hermes_config_set 'providers.9router.discover_models' 'true'
+          hermes_config_set 'terminal.backend' 'local'
+          hermes_config_set 'terminal.cwd' '/opt/data/workspace'
+          hermes_config_set 'terminal.timeout' '180'
+          hermes_config_set 'terminal.persistent_shell' 'true'
+          docker run --rm -v "$LIVE_ROOT/hermes:/opt/data" \
+            -e HERMES_HOME=/opt/data -e HOME=/opt/data \
+            "$HERMES_IMAGE" config check
+          # Hermes runs gateway + supervised dashboard in one container. This avoids
+          # split-container state/supervision races while matching the current Docker image.
+          docker rm -f hermes-dashboard >/dev/null 2>&1 || true
+          docker rm -f hermes-gateway >/dev/null 2>&1 || true
+          docker rm -f hermes >/dev/null 2>&1 || true
+          HERMES_UID_VALUE="$(id -u)"
+          HERMES_GID_VALUE="$(id -g)"
+
+          docker run -d \
+            --name hermes \
+            --init \
+            --shm-size=1g \
+            --memory=4g \
+            --cpus=2 \
+            --network host \
+            -v "$LIVE_ROOT/hermes:/opt/data" \
+            -e HERMES_UID="$HERMES_UID_VALUE" \
+            -e HERMES_GID="$HERMES_GID_VALUE" \
+            -e HERMES_HOME=/opt/data \
+            -e HOME=/opt/data \
+            -e HERMES_WRITE_SAFE_ROOT=/opt/data \
+            -e HERMES_DASHBOARD=1 \
+            -e HERMES_DASHBOARD_HOST=0.0.0.0 \
+            -e HERMES_DASHBOARD_PORT="$HERMES_DASHBOARD_PORT" \
+            -e HERMES_DASHBOARD_BASIC_AUTH_USERNAME=admin \
+            -e HERMES_DASHBOARD_BASIC_AUTH_PASSWORD="$STATE_PASSWORD" \
+            -e HERMES_DASHBOARD_BASIC_AUTH_SECRET="$HERMES_AUTH_SECRET" \
+            -e TERMINAL_ENV=local \
+            -e TERMINAL_LOCAL_PERSISTENT=true \
+            -e TERMINAL_CWD=/opt/data/workspace \
+            -e TERMINAL_TIMEOUT=180 \
+            "$HERMES_IMAGE" gateway run >/dev/null
+
+          wait_http_auth() {
+            local url="$1"; local seconds="${2:-120}"; local i
+            for ((i=1; i<=seconds; i++)); do
+              if curl -fsS --max-time 5 --user "admin:${STATE_PASSWORD}" "$url" >/dev/null 2>&1; then return 0; fi
+              sleep 1
+            done
+            echo "ERROR: authenticated service did not become ready: $url" >&2
+            return 1
+          }
+
+          wait_http_auth "http://127.0.0.1:${HERMES_DASHBOARD_PORT}/api/status" 180
+          HERMES_URL="$(start_tunnel hermes "http://127.0.0.1:${HERMES_DASHBOARD_PORT}" "/api/status" true)"
+
+          if [ "$setup_complete" != true ]; then
+            printf '%s\n' 'hermes' > "$CONTROL_STAGE"
+            {
+              echo '## Hermes setup'
+              echo
+              echo "- Hermes Dashboard: $HERMES_URL"
+              echo "- Control: $CONTROL_URL"
+              echo '- Dashboard username: `admin`'
+              echo '- Dashboard password: same value as the GitHub Secret `STATE_PASSWORD`'
+              echo
+              echo 'Hermes Telegram با preset رسمی `hermes-telegram` اجرا می‌شود؛ طبق مستندات Hermes این preset شامل toolset کامل Telegram/CLI از جمله file, terminal, web, browser, memory, skills, vision, image_gen, todo, tts, delegation, code_execution, cronjob, session_search, clarify و kanban است.'
+              echo '9Router provider: `9router` با API key ذخیره‌شده در `.env` و base URL داخلی `http://127.0.0.1:${NINEROUTER_PORT}/v1`.'
+              echo 'Workspace دائمی: `/opt/data/workspace` (برای ساخت/ویرایش/خواندن فایل و اجرای دستورات).'
+              echo 'در Hermes مدل/Provider مربوط به **9Router** را انتخاب کنید و Telegram را تنظیم کنید.'
+              echo 'بعد از ذخیره تنظیمات، در Control URL روی **Start Hermes Agent** بزنید.'
+            } >> "$GITHUB_STEP_SUMMARY"
+
+            SETUP_END_AT="$(( $(date +%s) + SETUP_TIMEOUT_SECONDS ))"
+            while [ ! -f "$CONTROL_START" ]; do
+              [ "$(date +%s)" -lt "$SETUP_END_AT" ] || { echo 'ERROR: Hermes setup timeout reached.' >&2; exit 1; }
+              if ! docker inspect -f '{{.State.Running}}' hermes 2>/dev/null | grep -qx true; then
+                echo 'ERROR: Hermes container stopped during setup.' >&2
+                docker logs --tail 160 hermes >&2 || true
+                exit 1
+              fi
+              sleep 2
+            done
+            printf 'completed\n' > "$LIVE_ROOT/SETUP_COMPLETE"
+            chmod 600 "$LIVE_ROOT/SETUP_COMPLETE"
+            setup_complete=true
+          fi
+
+          runtime_end_at="$(( $(date +%s) + TOTAL_MINUTES * 60 ))"
+          printf '%s\n' 'running' > "$CONTROL_STAGE"
+          {
+            echo '## Both services are running'
+            echo
+            echo "- 9Router: ${NINEROUTER_URL}"
+            echo "- Hermes Dashboard: ${HERMES_URL}"
+            echo "- Control: ${CONTROL_URL}"
+            echo
+            echo "The workflow remains alive until the ${TOTAL_MINUTES}-minute limit." 
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          while [ "$(date +%s)" -lt "$runtime_end_at" ]; do
+            if ! docker inspect -f '{{.State.Running}}' 9router 2>/dev/null | grep -qx true; then
+              echo 'ERROR: 9Router container stopped.' >&2
+              docker logs --tail 100 9router >&2 || true
+              exit 1
+            fi
+            if ! docker inspect -f '{{.State.Running}}' hermes 2>/dev/null | grep -qx true; then
+              echo 'ERROR: Hermes container stopped.' >&2
+              docker logs --tail 160 hermes >&2 || true
+              exit 1
+            fi
+            sleep 15
+          done
+
+      - name: Stop services and encrypt state
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          docker rm -f hermes-dashboard 2>/dev/null || true
+          docker rm -f hermes-gateway 2>/dev/null || true
+          docker rm -f hermes 2>/dev/null || true
+          docker rm -f 9router 2>/dev/null || true
+
+          if [ -z "${STATE_PASSWORD:-}" ] || [ ! -d "${LIVE_ROOT:-}" ]; then
+            echo 'No initialized runtime state to encrypt; skipping state save.'
+            exit 0
+          fi
+
+          mkdir -p "$CACHE_ROOT"
+          tmp_tar="$RUNTIME_ROOT/state-final.tar"
+          tmp_enc="$CACHE_ROOT/state.enc.tmp"
+
+          touch "$LIVE_ROOT/STATE_VERSION"
+          printf '2\n' > "$LIVE_ROOT/STATE_VERSION"
+          chmod 600 "$LIVE_ROOT/STATE_VERSION" "$LIVE_ROOT/SETUP_COMPLETE" 2>/dev/null || true
+          tar -cpf "$tmp_tar" -C "$LIVE_ROOT" 9router hermes STATE_VERSION SETUP_COMPLETE 2>/dev/null || tar -cpf "$tmp_tar" -C "$LIVE_ROOT" 9router hermes STATE_VERSION
+          openssl enc -aes-256-cbc -pbkdf2 -salt \
+            -in "$tmp_tar" \
+            -out "$tmp_enc" \
+            -pass env:STATE_PASSWORD
+          mv -f "$tmp_enc" "$CACHE_ROOT/state.enc"
+          rm -f "$tmp_tar"
+
+          chmod 600 "$CACHE_ROOT/state.enc"
+          echo 'Encrypted runtime state prepared for cache.'
+
+      - name: Save encrypted state cache
+        if: ${{ always() && hashFiles('.runtime/cache/state.enc') != '' }}
         uses: actions/cache/save@v4
         with:
-          path: .runtime/state.enc
-          key: hermes-9router-encrypted-${{ github.run_id }}
+          path: .runtime/cache/state.enc
+          key: hermes-9router-state-${{ github.repository_id }}-${{ github.run_id }}
