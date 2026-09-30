@@ -24,12 +24,12 @@ jobs:
       CONTROL_PORT: "18080"
       NINEROUTER_PORT: "20128"
       HERMES_DASHBOARD_PORT: "9119"
-      TOTAL_MINUTES: "330"
-      SETUP_TIMEOUT_SECONDS: "450"
-      NINEROUTER_IMAGE: "ghcr.io/decolua/9router:0.5.81"
-      HERMES_IMAGE: "nousresearch/hermes-agent:v2026.9.24"
+      TOTAL_MINUTES: "300"
+      SETUP_TIMEOUT_SECONDS: "1200"
+      NINEROUTER_IMAGE: "ghcr.io/decolua/9router:0.5.91@sha256:1d0fc80ee37b93a0165c9b88a87a414c3faebf44d6c1e580250d35a610b3061a"
+      HERMES_IMAGE: "nousresearch/hermes-agent:v2026.9.24@sha256:fca358f12efd65bfaaca05884166f15c0e2788375ca30d77061ac1ebc96452b7"
       CLOUDFLARED_VERSION: "2026.9.3"
-      CLOUDFLARED_SHA256: "77e26d8d900e0b8469f416239d14b5f296525fdf79fee6f511ef55609e3fbac2"
+      CLOUDFLARED_SHA256: "ea2c9bb2d5017a796b64bf36e605d727accf76a5500014bb12952ce11ae1f932"
 
     steps:
       - name: Checkout
@@ -170,25 +170,43 @@ jobs:
                       pass
 
           def validate_api_key(api_key: str) -> tuple[bool, str]:
-              req = urllib.request.Request(
+              authenticated = urllib.request.Request(
                   f"http://127.0.0.1:{NINEROUTER_PORT}/v1/models",
                   headers={"Authorization": f"Bearer {api_key}", "Accept": "application/json"},
                   method="GET",
               )
               try:
-                  with urllib.request.urlopen(req, timeout=12) as response:
+                  with urllib.request.urlopen(authenticated, timeout=12) as response:
                       if response.status != 200:
                           return False, f"9Router returned HTTP {response.status}."
                       body = response.read(1024 * 1024)
                       if b'"data"' not in body:
                           return False, "9Router returned an unexpected /v1/models response."
-                      return True, "API key accepted."
               except urllib.error.HTTPError as exc:
                   if exc.code == 401:
                       return False, "API key rejected by 9Router (401 Unauthorized)."
                   return False, f"9Router returned HTTP {exc.code}."
               except Exception as exc:
                   return False, f"Could not validate the API key: {exc.__class__.__name__}."
+
+              # The public Quick Tunnel exposes the whole 9Router port. Refuse to
+              # proceed until /v1 requires Bearer authentication even without the key.
+              unauthenticated = urllib.request.Request(
+                  f"http://127.0.0.1:{NINEROUTER_PORT}/v1/models",
+                  headers={"Accept": "application/json"},
+                  method="GET",
+              )
+              try:
+                  with urllib.request.urlopen(unauthenticated, timeout=12) as response:
+                      if response.status == 200:
+                          return False, "9Router /v1 is reachable without a Bearer API key. Enable API-key enforcement in the 9Router Dashboard and try again."
+                      return False, f"9Router returned unexpected HTTP {response.status} without authentication."
+              except urllib.error.HTTPError as exc:
+                  if exc.code == 401:
+                      return True, "API key accepted and /v1 authentication is enforced."
+                  return False, f"9Router returned HTTP {exc.code} without authentication; expected 401."
+              except Exception as exc:
+                  return False, f"Could not verify 9Router API-key enforcement: {exc.__class__.__name__}."
 
           def html(title: str, body: str) -> bytes:
               return f"""<!doctype html>
@@ -420,20 +438,33 @@ jobs:
           NINEROUTER_URL="$(start_tunnel 9router "http://127.0.0.1:${NINEROUTER_PORT}" "/api/health")"
 
           setup_complete=false
-          runtime_end_at=0
           if [ -f "$LIVE_ROOT/SETUP_COMPLETE" ]; then
             persisted_key="$(sed -n 's/^NINEROUTER_API_KEY=//p' "$LIVE_ROOT/hermes/.env" 2>/dev/null | tail -n1 || true)"
-            if [ -n "$persisted_key" ]; then
-              case "$persisted_key" in *$'\n'*|*$'\r'*|*[[:space:]]*) persisted_key="";; esac
-            fi
-            if [ -n "$persisted_key" ]; then
-              setup_complete=true
+            case "$persisted_key" in
+              ''|*$'\n'*|*$'\r'*|*[[:space:]]*)
+                persisted_key=""
+                ;;
+            esac
+
+            if [ -n "$persisted_key" ] && \
+               curl -fsS --max-time 15 \
+                 -H "Authorization: Bearer $persisted_key" \
+                 -H 'Accept: application/json' \
+                 "http://127.0.0.1:${NINEROUTER_PORT}/v1/models" >/dev/null; then
+              if ! curl -sS -o /dev/null -w '%{http_code}' --max-time 10 \
+                   "http://127.0.0.1:${NINEROUTER_PORT}/v1/models" | grep -q '^200$'; then
+                setup_complete=true
+              else
+                echo 'Saved setup exists, but 9Router /v1 is publicly reachable without a key; returning to guided setup.' >&2
+              fi
             else
-              echo 'Saved SETUP_COMPLETE exists but NINEROUTER_API_KEY is missing/invalid; re-enter the key.'
+              echo 'Saved 9Router API key is missing or no longer accepted; returning to guided key setup.' >&2
             fi
           fi
 
           if [ "$setup_complete" != true ]; then
+            rm -f "$LIVE_ROOT/SETUP_COMPLETE"
+            rm -f "$CONTROL_KEY_VALID" "$CONTROL_KEY" "$CONTROL_CONTINUE"
             printf '%s\n' '9router' > "$CONTROL_STAGE"
             {
               echo '## 9Router setup'
@@ -441,7 +472,9 @@ jobs:
               echo "- 9Router: $NINEROUTER_URL"
               echo "- Control: $CONTROL_URL"
               echo '- 9Router dashboard password: same value as the GitHub Secret `STATE_PASSWORD`'
-              echo '- API Key: create it manually in 9Router Dashboard → Settings → API Keys, then paste it into the protected Control page.'
+              echo '- API Key: create it manually in 9Router Dashboard → Settings → API Keys.'
+              echo '- API-key enforcement: in 9Router Dashboard, enable the option that requires a Bearer API key for `/v1` before pressing Continue.'
+              echo '- Then paste the API Key into the protected Control page.'
               echo
               echo 'After configuring 9Router, open the Control URL and press **Continue to Hermes setup**.'
             } >> "$GITHUB_STEP_SUMMARY"
@@ -467,10 +500,13 @@ jobs:
               fi
               sleep 2
             done
+            # 9Router setup is complete, but the overall guided setup is NOT complete
+            # until the user configures Hermes and presses "Start Hermes Agent" below.
           fi
 
-          # Hermes capability configuration: use the official full Telegram/CLI presets.
-          # These presets cover the complete supported tool registry for each platform.
+          # Hermes' official telegram preset is already the full personal-use toolset.
+          # Do not rewrite platform_toolsets with `config set`: current Hermes versions
+          # can serialize JSON-list values as strings and then resolve the wrong toolset.
           hermes_config_set() {
             local key="$1"
             local value="$2"
@@ -485,12 +521,9 @@ jobs:
           hermes_config_set 'terminal.cwd' '/opt/data/workspace'
           hermes_config_set 'terminal.timeout' '180'
           hermes_config_set 'terminal.persistent_shell' 'true'
-          hermes_config_set 'platform_toolsets.telegram' '["hermes-telegram"]'
-          hermes_config_set 'platform_toolsets.cli' '["hermes-cli"]'
-
           # Preflight the pinned Hermes image and verify the official Telegram tool preset is available.
           docker run --rm -v "$LIVE_ROOT/hermes:/opt/data" -e HERMES_HOME=/opt/data -e HOME=/opt/data "$HERMES_IMAGE" --version
-          TOOL_OUTPUT="$(docker run --rm -v "$LIVE_ROOT/hermes:/opt/data" -e HERMES_HOME=/opt/data -e HOME=/opt/data "$HERMES_IMAGE" chat --list-tools 2>&1)" || {
+          TOOL_OUTPUT="$(docker run --rm -v "$LIVE_ROOT/hermes:/opt/data" -e HERMES_HOME=/opt/data -e HOME=/opt/data "$HERMES_IMAGE" hermes-agent --list-tools 2>&1)" || {
             printf '%s\n' "$TOOL_OUTPUT" >&2
             exit 1
           }
@@ -511,15 +544,19 @@ jobs:
           test -n "$NINEROUTER_API_KEY" || { echo 'ERROR: 9Router API key is missing. Run the guided setup and enter it manually.' >&2; exit 1; }
           case "$NINEROUTER_API_KEY" in *$'\n'*|*$'\r'*|*[[:space:]]*) echo 'ERROR: 9Router API key contains whitespace/newlines.' >&2; exit 1;; esac
 
-          # Verify that the manually supplied/persisted key still authenticates against this 9Router instance.
           curl -fsS --max-time 15 \
             -H "Authorization: Bearer $NINEROUTER_API_KEY" \
             -H 'Accept: application/json' \
             "http://127.0.0.1:${NINEROUTER_PORT}/v1/models" >/dev/null || {
-              echo 'ERROR: saved 9Router API key is no longer accepted by 9Router.' >&2
-              echo 'Re-run guided setup and generate/enter a valid key from 9Router Dashboard → Settings → API Keys.' >&2
+              echo 'ERROR: 9Router API key is not accepted.' >&2
               exit 1
             }
+
+          if curl -sS -o /dev/null -w '%{http_code}' --max-time 10 \
+               "http://127.0.0.1:${NINEROUTER_PORT}/v1/models" | grep -q '^200$'; then
+            echo 'ERROR: 9Router /v1 is reachable without a Bearer key. Enable API-key enforcement in the 9Router Dashboard before continuing.' >&2
+            exit 1
+          fi
 
           HERMES_ENV_FILE="$LIVE_ROOT/hermes/.env"
           export NINEROUTER_API_KEY HERMES_ENV_FILE
@@ -667,7 +704,7 @@ jobs:
           done
 
       - name: Stop services and encrypt state
-        if: ${{ always() }}
+        if: ${{ success() }}
         shell: bash
         run: |
           set -Eeuo pipefail
